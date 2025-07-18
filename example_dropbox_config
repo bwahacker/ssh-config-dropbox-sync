@@ -1,0 +1,40 @@
+# Example SSH Config for ~/Dropbox/.ssh/config
+# This file shows the expected format for SSH configs that will be synced
+
+Host production-server
+    HostName prod.example.com
+    User deploy
+    Port 22
+    IdentityFile ~/.ssh/id_rsa_production
+
+Host staging-server
+    HostName staging.example.com
+    User admin
+    Port 2222
+    IdentityFile ~/.ssh/id_rsa_staging
+
+Host development
+    HostName dev.example.com
+    User developer
+    Port 22
+    ForwardAgent yes
+
+Host jump-host
+    HostName jump.example.com
+    User jumpuser
+    Port 22
+    ProxyCommand none
+
+Host internal-server
+    HostName internal.company.local
+    User admin
+    Port 22
+    ProxyCommand ssh -q -W %h:%p jump-host
+
+# Comments are preserved during sync
+Host backup-server
+    HostName backup.example.com
+    User backup
+    Port 22
+    Compression yes
+    CompressionLevel 9 
