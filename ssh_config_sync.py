@@ -10,6 +10,8 @@ always propagated and avoiding duplicate entries.
 import os
 import shutil
 import re
+import hashlib
+import json
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
@@ -115,6 +117,7 @@ class SSHConfigSync:
         self.dropbox_config = self.dropbox_ssh_dir / "config"
         self.local_ssh_dir = Path.home() / ".ssh"
         self.local_config = self.local_ssh_dir / "config"
+        self.hash_tracking_file = self.dropbox_ssh_dir / "config_history.json"
         
     def check_paths(self) -> Tuple[bool, bool]:
         """
@@ -131,14 +134,120 @@ class SSHConfigSync:
         
         return dropbox_exists, local_exists
     
+    def calculate_config_hash(self, config_path: Path) -> Optional[str]:
+        """
+        Calculate SHA256 hash of a config file.
+        
+        Args:
+            config_path: Path to the config file
+            
+        Returns:
+            Hex string of SHA256 hash, or None if file doesn't exist
+        """
+        if not config_path.exists():
+            return None
+            
+        try:
+            with open(config_path, 'rb') as f:
+                content = f.read()
+                return hashlib.sha256(content).hexdigest()
+        except Exception as e:
+            self.logger.error(f"Error calculating hash for {config_path}: {e}")
+            return None
+    
+    def load_hash_tracking(self) -> Dict[str, Dict]:
+        """
+        Load the hash tracking metadata from Dropbox.
+        
+        Returns:
+            Dictionary with hash as key and metadata as value
+        """
+        if not self.hash_tracking_file.exists():
+            return {}
+            
+        try:
+            with open(self.hash_tracking_file, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            self.logger.warning(f"Error loading hash tracking file: {e}")
+            return {}
+    
+    def save_hash_tracking(self, tracking_data: Dict[str, Dict]):
+        """
+        Save the hash tracking metadata to Dropbox.
+        
+        Args:
+            tracking_data: Dictionary with hash as key and metadata as value
+        """
+        try:
+            # Ensure directory exists
+            self.hash_tracking_file.parent.mkdir(parents=True, exist_ok=True)
+            
+            with open(self.hash_tracking_file, 'w') as f:
+                json.dump(tracking_data, f, indent=2, sort_keys=True)
+                
+        except Exception as e:
+            self.logger.error(f"Error saving hash tracking file: {e}")
+            
+    def update_hash_tracking(self, config_hash: str, source_location: str, timestamp: float):
+        """
+        Update hash tracking with a new or existing config hash.
+        
+        Args:
+            config_hash: SHA256 hash of the config
+            source_location: Where this hash was seen ('local' or 'dropbox')
+            timestamp: When this hash was seen
+        """
+        tracking_data = self.load_hash_tracking()
+        
+        if config_hash not in tracking_data:
+            # First time seeing this hash
+            tracking_data[config_hash] = {
+                'first_seen': datetime.fromtimestamp(timestamp).isoformat(),
+                'first_location': source_location,
+                'last_seen': datetime.fromtimestamp(timestamp).isoformat(),
+                'locations': [source_location]
+            }
+            self.logger.info(f"New config hash {config_hash[:8]}... first seen in {source_location}")
+        else:
+            # Update existing hash tracking
+            tracking_data[config_hash]['last_seen'] = datetime.fromtimestamp(timestamp).isoformat()
+            if source_location not in tracking_data[config_hash]['locations']:
+                tracking_data[config_hash]['locations'].append(source_location)
+                self.logger.info(f"Config hash {config_hash[:8]}... now seen in {source_location}")
+        
+        self.save_hash_tracking(tracking_data)
+    
+    def configs_are_identical(self) -> bool:
+        """
+        Check if local and Dropbox configs have identical content (ignoring timestamps).
+        
+        Returns:
+            True if configs have identical content, False otherwise
+        """
+        local_hash = self.calculate_config_hash(self.local_config)
+        dropbox_hash = self.calculate_config_hash(self.dropbox_config)
+        
+        if local_hash is None or dropbox_hash is None:
+            return False
+            
+        identical = local_hash == dropbox_hash
+        
+        if identical:
+            self.logger.info(f"Configs are identical (hash: {local_hash[:8]}...)")
+        else:
+            self.logger.info(f"Configs differ (local: {local_hash[:8]}..., dropbox: {dropbox_hash[:8]}...)")
+            
+        return identical
+    
     def determine_sync_direction(self) -> str:
         """
-        Determine which direction to sync based on file timestamps.
+        Determine which direction to sync based on content hashes and file timestamps.
         
         Returns:
             'dropbox_to_local' if Dropbox is newer or local doesn't exist
             'local_to_dropbox' if local is newer or Dropbox doesn't exist
-            'no_sync' if both files exist and have same timestamp
+            'no_sync' if both files exist and have identical content or same timestamp
             'error' if neither file exists
         """
         local_exists = self.local_config.exists()
@@ -156,7 +265,12 @@ class SSHConfigSync:
             self.logger.info("No Dropbox config exists, will copy from local")
             return 'local_to_dropbox'
             
-        # Both exist, compare timestamps
+        # Both exist, first check if content is identical
+        if self.configs_are_identical():
+            self.logger.info("Configs have identical content, no sync needed")
+            return 'no_sync'
+            
+        # Content differs, compare timestamps
         dropbox_mtime = self.dropbox_config.stat().st_mtime
         local_mtime = self.local_config.stat().st_mtime
         
@@ -164,7 +278,7 @@ class SSHConfigSync:
         self.logger.info(f"Local config modified: {datetime.fromtimestamp(local_mtime)}")
         
         if abs(dropbox_mtime - local_mtime) < 1:  # Within 1 second, consider same
-            self.logger.info("Files have same timestamp, no sync needed")
+            self.logger.info("Files have same timestamp but different content, no sync to avoid conflicts")
             return 'no_sync'
         elif dropbox_mtime > local_mtime:
             self.logger.info("Dropbox config is newer, syncing to local")
@@ -228,6 +342,17 @@ class SSHConfigSync:
         try:
             dropbox_exists, local_exists = self.check_paths()
             
+            # Track existing config hashes for history
+            if local_exists:
+                local_hash = self.calculate_config_hash(self.local_config)
+                if local_hash:
+                    self.update_hash_tracking(local_hash, "local", self.local_config.stat().st_mtime)
+                    
+            if dropbox_exists:
+                dropbox_hash = self.calculate_config_hash(self.dropbox_config)
+                if dropbox_hash:
+                    self.update_hash_tracking(dropbox_hash, "dropbox", self.dropbox_config.stat().st_mtime)
+            
             # Determine sync direction
             sync_direction = self.determine_sync_direction()
             
@@ -282,6 +407,12 @@ class SSHConfigSync:
             
             self.parser.write_config(merged_hosts, target_path)
             
+            # Update hash tracking for the newly written config
+            new_hash = self.calculate_config_hash(target_path)
+            if new_hash:
+                target_location = "local" if sync_direction == 'dropbox_to_local' else "dropbox"
+                self.update_hash_tracking(new_hash, target_location, target_path.stat().st_mtime)
+            
             direction_str = "Dropbox → Local" if sync_direction == 'dropbox_to_local' else "Local → Dropbox"
             self.logger.info(f"SSH config sync completed successfully ({direction_str})")
             return True
@@ -289,6 +420,30 @@ class SSHConfigSync:
         except Exception as e:
             self.logger.error(f"Error during sync: {e}")
             return False
+    
+    def show_hash_history(self):
+        """Display the config hash history."""
+        tracking_data = self.load_hash_tracking()
+        
+        if not tracking_data:
+            self.logger.info("No config hash history found")
+            return
+            
+        self.logger.info("=== SSH Config Hash History ===")
+        
+        # Sort by first_seen date
+        sorted_hashes = sorted(
+            tracking_data.items(),
+            key=lambda x: x[1]['first_seen']
+        )
+        
+        for config_hash, data in sorted_hashes:
+            self.logger.info(f"\nHash: {config_hash[:12]}...")
+            self.logger.info(f"  First seen: {data['first_seen']} in {data['first_location']}")
+            self.logger.info(f"  Last seen: {data['last_seen']}")
+            self.logger.info(f"  Locations: {', '.join(data['locations'])}")
+            
+        self.logger.info(f"\nTotal unique configs tracked: {len(tracking_data)}")
 
 def setup_logging(verbose: bool = False):
     """Setup logging configuration."""
@@ -314,15 +469,25 @@ def main():
         action='store_true', 
         help="Enable verbose logging"
     )
+    parser.add_argument(
+        '--show-history',
+        action='store_true',
+        help="Show config hash history and exit"
+    )
     
     args = parser.parse_args()
     
     setup_logging(args.verbose)
     logger = logging.getLogger(__name__)
     
+    sync_tool = SSHConfigSync()
+    
+    if args.show_history:
+        sync_tool.show_hash_history()
+        return 0
+    
     logger.info("Starting SSH Config Dropbox Sync")
     
-    sync_tool = SSHConfigSync()
     success = sync_tool.sync(dry_run=args.dry_run)
     
     if success:
