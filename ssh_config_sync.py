@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-SSH Config Dropbox Sync Tool
+SSH Config Bidirectional Sync Tool
 
-This script intelligently merges SSH config files from ~/Dropbox/.ssh/config
-to ~/.ssh/config, ensuring only newer configurations are synced and avoiding
-duplicate entries.
+This script intelligently syncs SSH config files between ~/Dropbox/.ssh/config
+and ~/.ssh/config in both directions, ensuring the newest configuration is
+always propagated and avoiding duplicate entries.
 """
 
 import os
@@ -131,36 +131,62 @@ class SSHConfigSync:
         
         return dropbox_exists, local_exists
     
-    def is_dropbox_newer(self) -> bool:
+    def determine_sync_direction(self) -> str:
         """
-        Check if Dropbox config is newer than local config.
+        Determine which direction to sync based on file timestamps.
         
         Returns:
-            True if Dropbox config is newer or local doesn't exist
+            'dropbox_to_local' if Dropbox is newer or local doesn't exist
+            'local_to_dropbox' if local is newer or Dropbox doesn't exist
+            'no_sync' if both files exist and have same timestamp
+            'error' if neither file exists
         """
-        if not self.local_config.exists():
-            return True
+        local_exists = self.local_config.exists()
+        dropbox_exists = self.dropbox_config.exists()
+        
+        if not local_exists and not dropbox_exists:
+            self.logger.warning("Neither local nor Dropbox config exists")
+            return 'error'
+        
+        if not local_exists:
+            self.logger.info("No local config exists, will copy from Dropbox")
+            return 'dropbox_to_local'
             
-        if not self.dropbox_config.exists():
-            return False
+        if not dropbox_exists:
+            self.logger.info("No Dropbox config exists, will copy from local")
+            return 'local_to_dropbox'
             
+        # Both exist, compare timestamps
         dropbox_mtime = self.dropbox_config.stat().st_mtime
         local_mtime = self.local_config.stat().st_mtime
         
-        dropbox_newer = dropbox_mtime > local_mtime
-        
         self.logger.info(f"Dropbox config modified: {datetime.fromtimestamp(dropbox_mtime)}")
         self.logger.info(f"Local config modified: {datetime.fromtimestamp(local_mtime)}")
-        self.logger.info(f"Dropbox is newer: {dropbox_newer}")
         
-        return dropbox_newer
+        if abs(dropbox_mtime - local_mtime) < 1:  # Within 1 second, consider same
+            self.logger.info("Files have same timestamp, no sync needed")
+            return 'no_sync'
+        elif dropbox_mtime > local_mtime:
+            self.logger.info("Dropbox config is newer, syncing to local")
+            return 'dropbox_to_local'
+        else:
+            self.logger.info("Local config is newer, syncing to Dropbox")
+            return 'local_to_dropbox'
+    
+    def backup_config(self, config_path: Path):
+        """Create a backup of the specified config before modifying."""
+        if config_path.exists():
+            backup_path = config_path.with_suffix('.config.backup')
+            shutil.copy2(config_path, backup_path)
+            self.logger.info(f"Created backup: {backup_path}")
     
     def backup_local_config(self):
         """Create a backup of the local config before modifying."""
-        if self.local_config.exists():
-            backup_path = self.local_config.with_suffix('.config.backup')
-            shutil.copy2(self.local_config, backup_path)
-            self.logger.info(f"Created backup: {backup_path}")
+        self.backup_config(self.local_config)
+    
+    def backup_dropbox_config(self):
+        """Create a backup of the Dropbox config before modifying."""
+        self.backup_config(self.dropbox_config)
     
     def merge_configs(self, dropbox_hosts: Dict[str, Dict[str, str]], 
                      local_hosts: Dict[str, Dict[str, str]]) -> Dict[str, Dict[str, str]]:
@@ -191,7 +217,7 @@ class SSHConfigSync:
     
     def sync(self, dry_run: bool = False) -> bool:
         """
-        Perform the SSH config sync operation.
+        Perform the SSH config sync operation in both directions.
         
         Args:
             dry_run: If True, only show what would be done without making changes
@@ -202,42 +228,62 @@ class SSHConfigSync:
         try:
             dropbox_exists, local_exists = self.check_paths()
             
-            if not dropbox_exists:
-                self.logger.warning("No Dropbox SSH config found, nothing to sync")
+            # Determine sync direction
+            sync_direction = self.determine_sync_direction()
+            
+            if sync_direction == 'error':
+                self.logger.error("No config files found to sync")
                 return False
             
-            if local_exists and not self.is_dropbox_newer():
-                self.logger.info("Local config is up to date, no sync needed")
+            if sync_direction == 'no_sync':
+                self.logger.info("Configs are in sync, no changes needed")
                 return True
             
-            # Parse configurations
-            self.logger.info("Parsing Dropbox SSH config...")
-            dropbox_hosts = self.parser.parse_config(self.dropbox_config)
+            # Parse configurations based on sync direction
+            if sync_direction == 'dropbox_to_local':
+                self.logger.info("Syncing from Dropbox to local...")
+                source_hosts = self.parser.parse_config(self.dropbox_config)
+                target_hosts = self.parser.parse_config(self.local_config) if local_exists else {}
+                merged_hosts = self.merge_configs(source_hosts, target_hosts)
+                target_path = self.local_config
+                
+                self.logger.info(f"Found {len(source_hosts)} hosts in Dropbox config")
+                self.logger.info(f"Found {len(target_hosts)} hosts in local config")
+                
+            else:  # local_to_dropbox
+                self.logger.info("Syncing from local to Dropbox...")
+                source_hosts = self.parser.parse_config(self.local_config)
+                target_hosts = self.parser.parse_config(self.dropbox_config) if dropbox_exists else {}
+                merged_hosts = self.merge_configs(source_hosts, target_hosts)
+                target_path = self.dropbox_config
+                
+                self.logger.info(f"Found {len(source_hosts)} hosts in local config")
+                self.logger.info(f"Found {len(target_hosts)} hosts in Dropbox config")
             
-            self.logger.info("Parsing local SSH config...")
-            local_hosts = self.parser.parse_config(self.local_config) if local_exists else {}
-            
-            self.logger.info(f"Found {len(dropbox_hosts)} hosts in Dropbox config")
-            self.logger.info(f"Found {len(local_hosts)} hosts in local config")
-            
-            # Merge configurations
-            merged_hosts = self.merge_configs(dropbox_hosts, local_hosts)
             self.logger.info(f"Merged result contains {len(merged_hosts)} hosts")
             
             if dry_run:
-                self.logger.info("DRY RUN - Would update local config with:")
+                direction_str = "local" if sync_direction == 'dropbox_to_local' else "Dropbox"
+                self.logger.info(f"DRY RUN - Would update {direction_str} config with:")
                 for host in merged_hosts:
-                    if host not in local_hosts:
+                    if host not in target_hosts:
                         self.logger.info(f"  + NEW: {host}")
-                    elif host in dropbox_hosts:
+                    elif host in source_hosts:
                         self.logger.info(f"  ~ UPDATED: {host}")
                 return True
             
             # Create backup and write merged config
-            self.backup_local_config()
-            self.parser.write_config(merged_hosts, self.local_config)
+            if sync_direction == 'dropbox_to_local':
+                self.backup_local_config()
+            else:
+                self.backup_dropbox_config()
+                # Ensure Dropbox .ssh directory exists
+                self.dropbox_ssh_dir.mkdir(parents=True, exist_ok=True)
             
-            self.logger.info("SSH config sync completed successfully")
+            self.parser.write_config(merged_hosts, target_path)
+            
+            direction_str = "Dropbox → Local" if sync_direction == 'dropbox_to_local' else "Local → Dropbox"
+            self.logger.info(f"SSH config sync completed successfully ({direction_str})")
             return True
             
         except Exception as e:
@@ -256,7 +302,7 @@ def setup_logging(verbose: bool = False):
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="Sync SSH config from Dropbox to local SSH directory"
+        description="Bidirectionally sync SSH config between Dropbox and local SSH directory"
     )
     parser.add_argument(
         '--dry-run', 

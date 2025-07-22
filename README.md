@@ -1,25 +1,29 @@
-# SSH Config Dropbox Sync
+# SSH Config Bidirectional Sync
 
-A Python script that intelligently syncs SSH configuration files between your Dropbox and local SSH directory.
+A Python script that intelligently syncs SSH configuration files between your Dropbox and local SSH directory in both directions.
 
 ## Features
 
+- **Bidirectional Sync**: Syncs in both directions - always uses the newest config regardless of location
 - **Smart Merging**: Intelligently merges SSH config entries without duplicating existing configurations
-- **Timestamp Checking**: Only syncs when the Dropbox config is newer than your local config
-- **Backup Creation**: Automatically creates backups of your local config before making changes
+- **Timestamp Checking**: Compares modification times to determine which config is newer
+- **Backup Creation**: Automatically creates backups before making changes to either location
 - **Dry Run Mode**: Test what would be changed without actually modifying files
 - **Detailed Logging**: Comprehensive logging to track what's happening during sync
 
 ## How It Works
 
-1. Checks for SSH config file in `~/Dropbox/.ssh/config`
-2. Compares modification timestamps with your local `~/.ssh/config`
-3. If Dropbox config is newer (or no local config exists), parses both files
+1. Checks for SSH config files in both `~/Dropbox/.ssh/config` and `~/.ssh/config`
+2. Compares modification timestamps to determine which is newer
+3. Syncs in the appropriate direction:
+   - **Dropbox → Local**: When Dropbox config is newer or no local config exists
+   - **Local → Dropbox**: When local config is newer or no Dropbox config exists
+   - **No sync**: When timestamps are identical (within 1 second)
 4. Intelligently merges configurations:
-   - Adds new Host entries from Dropbox
-   - Updates existing entries with Dropbox values (Dropbox takes precedence)
-   - Preserves local-only entries
-5. Creates a backup of your existing config
+   - Adds new Host entries from the source
+   - Updates existing entries with source values (newer file takes precedence)
+   - Preserves target-only entries
+5. Creates a backup of the target config
 6. Writes the merged configuration
 
 ## Usage
@@ -65,7 +69,8 @@ The script supports standard SSH config format including:
 
 ## Example
 
-If your Dropbox config contains:
+**Scenario 1: Dropbox is newer**
+If your Dropbox config (modified today) contains:
 ```
 Host myserver
     HostName example.com
@@ -73,11 +78,23 @@ Host myserver
     Port 2222
 ```
 
-And your local config has:
+And your local config (modified yesterday) has:
 ```
 Host localhost
     HostName 127.0.0.1
     User root
 ```
 
-The merged result will contain both entries, with the Dropbox entry taking precedence for any conflicts.
+The script will sync **Dropbox → Local**, and the merged local result will contain both entries.
+
+**Scenario 2: Local is newer**
+If you update your local config with a new server and it becomes newer than Dropbox:
+```
+Host newserver
+    HostName new.example.com
+    User deploy
+```
+
+The script will sync **Local → Dropbox**, copying your local changes to Dropbox while preserving existing Dropbox entries.
+
+**In both cases:** The newer file's entries take precedence for conflicts, but all unique entries from both files are preserved.
